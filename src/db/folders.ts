@@ -38,11 +38,25 @@ export class FolderNameTakenError extends Error {
   override readonly name = "FolderNameTakenError";
 }
 
-/** 同じ名前のフォルダを持っていれば FolderNameTakenError */
+/** その ID は、消したフォルダか、ほかの人のフォルダが使っている */
+export class FolderIdTakenError extends Error {
+  override readonly name = "FolderIdTakenError";
+}
+
+/**
+ * フォルダを作る。ID はクライアントが決めてもよく、同じ ID で送り直しても 1 つしか作らない
+ * （docs/decisions/sync.md の 5「操作を冪等に受ける」）。
+ *
+ * - そのユーザーの消していないフォルダに同じ ID があれば、作らずにそれを返す（created: false）。
+ *   前に送って、応答だけ届かなかった場合。名前がほかの端末で変わっていても、今の名前で返す
+ * - 消したフォルダや、ほかの人のフォルダに同じ ID があれば FolderIdTakenError
+ *   （消したフォルダを、古い送り直しで生き返らせない）
+ * - 同じ名前の別のフォルダを持っていれば FolderNameTakenError
+ */
 export async function createFolder(
   db: Database,
   input: { userId: string; id: string; name: string; now: Date },
-): Promise<Folder> {
+): Promise<{ folder: Folder; created: boolean }> {
   const created = await db
     .insert(folders)
     .values({
@@ -58,8 +72,25 @@ export async function createFolder(
     .onConflictDoNothing()
     .returning()
     .get();
-  if (!created) throw new FolderNameTakenError(input.name);
-  return created;
+  if (created) return { folder: created, created: true };
+  // どの一意制約にぶつかったかを確かめる。まず、そのユーザーのフォルダだけを引く
+  const mine = await db
+    .select()
+    .from(folders)
+    .where(and(eq(folders.userId, input.userId), eq(folders.id, input.id)))
+    .get();
+  if (mine) {
+    if (mine.deletedAt !== null) throw new FolderIdTakenError(input.id);
+    return { folder: mine, created: false };
+  }
+  // ほかの人のフォルダは、中身を読まず、その ID が使われているかだけを見る
+  const taken = await db
+    .select({ id: folders.id })
+    .from(folders)
+    .where(eq(folders.id, input.id))
+    .get();
+  if (taken) throw new FolderIdTakenError(input.id);
+  throw new FolderNameTakenError(input.name);
 }
 
 /** フォルダの名前を変える。なければ undefined、同じ名前が別にあれば FolderNameTakenError */
