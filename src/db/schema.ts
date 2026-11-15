@@ -242,6 +242,12 @@ export const feeds = sqliteTable(
      * 配るのが途中で落ちても、次の取得でここから配り直せる
      */
     deliveredUntil: integer("delivered_until", { mode: "timestamp_ms" }),
+    /**
+     * 古い記事を、どこまで片付けたか（記事の created_at。docs/decisions/retention.md）。
+     * 取得のたびに、取得の間隔の数倍の幅までずつ進める。null なら、まだ片付けていない
+     * （フィードを登録した時刻から始める）
+     */
+    cleanedUntil: integer("cleaned_until", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   },
   (t) => [index("feeds_next_fetch_at_idx").on(t.nextFetchAt)],
@@ -358,6 +364,9 @@ export const userArticles = sqliteTable(
     index("user_articles_starred_idx")
       .on(t.userId, t.starredAt)
       .where(sql`${t.starredAt} is not null`),
+    // 記事を消すとき、外部キーの確かめで、その記事を指す行を探す。これがないと、記事を 1 件
+    // 消すたびに受信箱の表を全部読む（docs/decisions/retention.md の 6）
+    index("user_articles_article_id_idx").on(t.articleId),
   ],
 );
 
@@ -399,6 +408,21 @@ export const userArticleRemovals = sqliteTable(
 export const seqFloors = sqliteTable("seq_floors", {
   tableName: text("table_name").primaryKey(),
   floor: integer("floor").notNull(),
+});
+
+/**
+ * 受信箱の消した記録を、人ごとにどこまで回収したか（docs/decisions/sync.md の 3、retention.md の 5）。
+ * 回収するとき、回収する記録の番号の最大まで、先にここを引き上げる。その人のカーソルの位置が
+ * これより前なら、その先の消した記録が回収されているかもしれないので、最初から同期し直してもらう。
+ *
+ * 人ごとに持つのは、番号が受信箱の表全体で 1 つの並びだから。全員で 1 つにすると、受信箱の変わらない
+ * 人のカーソルが、ほかの人の回収で古くなり、同期し直しを繰り返す
+ */
+export const removalHorizons = sqliteTable("removal_horizons", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
 });
 
 export type User = typeof users.$inferSelect;

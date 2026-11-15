@@ -1,5 +1,11 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
-import { INITIAL_CURSOR, readChanges, type SyncCursor, type SyncPosition } from "../db/sync";
+import {
+  INITIAL_CURSOR,
+  isCursorExpired,
+  readChanges,
+  type SyncCursor,
+  type SyncPosition,
+} from "../db/sync";
 import type { Platform } from "../platform";
 import type { AuthVariables } from "./auth";
 import { defaultHook } from "./hook";
@@ -136,7 +142,7 @@ const syncRoute = createRoute({
       },
     },
     400: {
-      description: "カーソルが読めない（最初から同期し直す）",
+      description: "カーソルが読めないか、古すぎて消した記録を送れない（最初から同期し直す）",
       content: { "application/json": { schema: ErrorSchema } },
     },
   },
@@ -152,11 +158,16 @@ export function syncApi(platform: Platform) {
         return c.json(errorBody("invalid_cursor", "cursor is invalid; start over without it"), 400);
       }
 
+      const userId = c.get("user").id;
       const changes = await readChanges(platform.db, {
-        userId: c.get("user").id,
+        userId,
         cursor,
         now: platform.now(),
       });
+      // 消した記録の回収は、読んだあとで確かめる（isCursorExpired）
+      if (raw !== undefined && (await isCursorExpired(platform.db, { userId, cursor }))) {
+        return c.json(errorBody("invalid_cursor", "cursor is too old; start over without it"), 400);
+      }
       return c.json(
         {
           cursor: encodeSyncCursor(changes.cursor),
