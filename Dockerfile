@@ -9,6 +9,39 @@ RUN corepack enable
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
+# Rust の処理（crates/）を、napi-rs のネイティブのモジュールにする（docs/decisions/tech-stack.md の 5）。
+# ビルドするマシンの CPU のまま、イメージの CPU（TARGETARCH）向けにクロスコンパイルする（arm64 を
+# エミュレーションでコンパイルすると遅いため）。土台は、動かすイメージと同じ Debian（bookworm）にそろえ、
+# glibc の版を合わせる
+FROM --platform=$BUILDPLATFORM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS native
+ARG TARGETARCH
+ARG BUILDARCH
+WORKDIR /app
+RUN set -eu; \
+  case "$TARGETARCH" in \
+    amd64) target=x86_64-unknown-linux-gnu; packages="gcc-x86-64-linux-gnu libc6-dev-amd64-cross" ;; \
+    arm64) target=aarch64-unknown-linux-gnu; packages="gcc-aarch64-linux-gnu libc6-dev-arm64-cross" ;; \
+    *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+  esac; \
+  echo "$target" > /rust-target; \
+  if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+    # クロスコンパイル用の gcc と、相手の CPU 向けの C ライブラリ（つなぐときに要る）を入れる
+    apt-get update && apt-get install -y --no-install-recommends $packages && rm -rf /var/lib/apt/lists/*; \
+  fi
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN set -eu; \
+  target="$(cat /rust-target)"; \
+  rustup target add "$target"; \
+  # 同じ CPU 向けなら、クロスコンパイル用の gcc は入れていないので、ふつうの cc でつなぐ
+  if [ "$TARGETARCH" = "$BUILDARCH" ]; then \
+    unset CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER; \
+  fi; \
+  cargo build --release --locked -p sendo-node --target "$target"; \
+  cp "target/$target/release/libsendo_node.so" /sendo.node
+
 # バンドルを作る。依存はバンドルに入れず（--packages=external）、動かすときに入れる
 FROM base AS build
 # インストール時のスクリプト（wrangler types など）は、バンドルには要らないので動かさない
@@ -17,7 +50,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN pnpm build:node
 
-# 動かすイメージ。動かすのに要る依存と、バンドルと、マイグレーションだけを入れる
+# 動かすイメージ。動かすのに要る依存と、バンドルと、マイグレーションと、Rust のモジュールだけを入れる
 FROM base AS runtime
 ENV NODE_ENV=production \
     PORT=8787 \
@@ -28,6 +61,7 @@ RUN pnpm install --prod --frozen-lockfile --ignore-scripts \
   && chown node:node /data
 COPY migrations ./migrations
 COPY --from=build /app/dist/node ./dist/node
+COPY --from=native /sendo.node ./native/sendo.node
 USER node
 VOLUME ["/data"]
 EXPOSE 8787
